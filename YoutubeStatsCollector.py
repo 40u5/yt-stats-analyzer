@@ -3,14 +3,65 @@ import requests
 from api_key_rotator import APIKeyRotator
 from langdetect import detect
 from transformers import MarianMTModel, MarianTokenizer
-from langdetect import detect
 from typing import Optional
 
 class YouTubeStatsCollector:
-
-    def __init__(self):
+    def __init__(self, keywords: str = "technology",
+                 video_duration: int = 1,
+                 order: str = "date",
+                 video_category_id: Optional[int] = None) -> None:
+        """
+        Initialize the YouTube Stats Collector.
+        
+        Args:
+            keywords: Search keywords for finding videos (default: "technology")
+            video_duration: Video duration filter (0=short, 1=medium, 2=long) (default: 1)
+            language: Language preference (default: "en")
+            order: Sort order for search results (default: "date")
+                   Valid options: "date", "rating", "relevance", "title", "videoCount", "viewCount"
+            video_category_id: YouTube video category ID filter (default: None)
+                              Valid options: 1=Film, 2=Autos, 10=Music, 15=Pets, 17=Sports, 19=Travel,
+                              20=Gaming, 22=People, 23=Comedy, 24=Entertainment, 25=News, 26=Howto,
+                              27=Education, 28=Science, 29=Nonprofits
+        """
         self.rotator = APIKeyRotator()
-
+        self.keywords = keywords
+        
+        # Valid order options for YouTube Data API v3
+        self.valid_orders = {"date", "rating", "relevance", "title", "videoCount", "viewCount"}
+        if order not in self.valid_orders:
+            raise ValueError(f"order must be one of: {', '.join(sorted(self.valid_orders))}")
+        self.order = order
+        
+        # Valid video category IDs for YouTube Data API v3
+        self.valid_category_ids = {
+            1: "Film & Animation",
+            2: "Autos & Vehicles", 
+            10: "Music",
+            15: "Pets & Animals",
+            17: "Sports",
+            19: "Travel & Events",
+            20: "Gaming",
+            22: "People & Blogs",
+            23: "Comedy",
+            24: "Entertainment",
+            25: "News & Politics",
+            26: "Howto & Style",
+            27: "Education",
+            28: "Science & Technology",
+            29: "Nonprofits & Activism"
+        }
+        if video_category_id is not None and video_category_id not in self.valid_category_ids:
+            valid_ids = sorted(self.valid_category_ids.keys())
+            raise ValueError(f"video_category_id must be one of: {valid_ids} or None")
+        self.video_category_id = video_category_id
+        
+        # Map video_duration integer to YouTube API duration strings
+        self.duration_map = ("short", "medium", "long")
+        if video_duration not in [0, 1, 2]:
+            raise ValueError("video_duration must be 0 (short), 1 (medium), or 2 (long)")
+        self.video_duration = self.duration_map[video_duration]
+    
     # --------------------------------------------------------------------- #
     # Internal helpers
     # --------------------------------------------------------------------- #
@@ -37,16 +88,23 @@ class YouTubeStatsCollector:
         """
         Paginate through YouTube search results and return up to `max_channels`
         channel IDs. If max_channels is None, returns *all* channels available.
+        
+        Args:
+            max_results_per_page: Number of results per API call
+            max_channels: Maximum number of channels to return (None for all)
+            keywords: Search keywords/query
+            video_duration: Duration filter (0=short <4min, 1=medium 4-20min, 2=long >20min)
+            language: Language code for search results
         """
         params = {
             "part": "snippet",
-            "order": "date",
+            "order": self.order,
             "type": "video",
             "relevanceLanguage": "en",
             "regionCode": "US",
             "videoCategoryId": "28",
-            "videoDuration": "medium",
-            "q": "technology",
+            "videoDuration": self.video_duration,
+            "q": self.keywords,
             "maxResults": str(max_results_per_page),
         }
 
@@ -78,6 +136,7 @@ class YouTubeStatsCollector:
             if not next_page:
                 break
         return channels
+
 
     def fetch_uploads_playlist(self, channel_id: str) -> str:
         """Return the uploads-playlist ID for a channel."""
@@ -186,7 +245,33 @@ class YouTubeStatsCollector:
         return results
 
     def save_to_json(self, results: dict, path: str = "results.json") -> None:
-        """Dump the results as pretty-printed JSON."""
+        """Dump the results as pretty-printed JSON, appending to existing data if file exists."""
+        import os
+        
+        existing_data = {}
+        
+        # Load existing data if file exists
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    existing_data = json.load(f)
+            except (json.JSONDecodeError, IOError):
+                # If file is corrupted or can't be read, start fresh
+                existing_data = {}
+        
+        # Merge new results with existing data
+        existing_data.update(results)
+        
+        # Write the combined data back to file
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(results, f, ensure_ascii=False, indent=2)
+            json.dump(existing_data, f, ensure_ascii=False, indent=2)
         print(f"Wrote {path}")
+
+
+# ------------------------------------------------------------------------- #
+# CLI entry-point
+# ------------------------------------------------------------------------- #
+if __name__ == "__main__":
+    fetcher = YouTubeStatsCollector(video_duration=1, order="relevance", video_category_id=28, keywords="money")
+    data = fetcher.build_results(num_channels=1000, max_videos_per_channel=10)
+    fetcher.save_to_json(data, path="results.json")
