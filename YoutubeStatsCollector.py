@@ -8,11 +8,8 @@ from typing import Optional
 
 class YouTubeStatsCollector:
 
-    def __init__(self, max_videos_per_channel: int = 100, batch_size: int = 50):
+    def __init__(self):
         self.rotator = APIKeyRotator()
-        self.max_videos = max_videos_per_channel
-        self.batch_size = batch_size
-
 
     # --------------------------------------------------------------------- #
     # Internal helpers
@@ -53,11 +50,9 @@ class YouTubeStatsCollector:
             "maxResults": str(max_results_per_page),
         }
 
-
         channels: list[str] = []
         next_page: str | None = None
 
-        
         while True:
             params["maxResults"] = str(max_results_per_page)
             if next_page:
@@ -71,14 +66,14 @@ class YouTubeStatsCollector:
                 retries=len(self.rotator.keys),
             )
 
-            # extract this page’s channel IDs
+            # extract this page's channel IDs
             for item in data.get("items", []):
                 channels.append(item["snippet"]["channelId"])
-                # if we’ve hit our user‐requested limit, stop here
+                # if we've hit our user‐requested limit, stop here
                 if max_channels and len(channels) >= max_channels:
                     return channels[:max_channels]
 
-            # see if there’s another page
+            # see if there's another page
             next_page = data.get("nextPageToken")
             if not next_page:
                 break
@@ -94,17 +89,18 @@ class YouTubeStatsCollector:
         )
         return data["items"][0]["contentDetails"]["relatedPlaylists"]["uploads"]
 
-    def fetch_channel_video_ids(self, uploads_pl: str) -> list[str]:
-        """Iterate through a channel’s uploads playlist (paginated)."""
+    def fetch_channel_video_ids(self, uploads_pl: str, max_videos: int) -> list[str]:
+        """Iterate through a channel's uploads playlist (paginated)."""
         print(f"Fetching video IDs from uploads playlist {uploads_pl} …")
         video_ids: list[str] = []
         next_token = None
+        batch_size = 50  # Fixed batch size for API requests
 
-        while len(video_ids) < self.max_videos:
+        while len(video_ids) < max_videos:
             params = {
                 "part": "contentDetails",
                 "playlistId": uploads_pl,
-                "maxResults": self.batch_size,
+                "maxResults": batch_size,
                 "pageToken": next_token or ""
             }
             data = self._yt_get(
@@ -118,22 +114,22 @@ class YouTubeStatsCollector:
             if not next_token:
                 break
 
-        return video_ids[: self.max_videos]
-
+        return video_ids[:max_videos]
 
     def fetch_video_pairs(
         self, video_ids: list[str]
     ) -> Optional[list[list]]:
         """
         For each video ID, fetches title & view count.
-        Detects the title’s language; if not English, translates it using MarianMT.
+        Detects the title's language; if not English, translates it using MarianMT.
         Returns [[translated_title, view_count], …], or None on API errors.
         """
         pairs: list[list] = []
+        batch_size = 50  # Fixed batch size for API requests
         print(f"Fetching video pairs for {len(video_ids)} videos …")
 
-        for i in range(0, len(video_ids), self.batch_size):
-            chunk = video_ids[i : i + self.batch_size]
+        for i in range(0, len(video_ids), batch_size):
+            chunk = video_ids[i : i + batch_size]
             data = self._yt_get(
                 "https://www.googleapis.com/youtube/v3/videos",
                 {
@@ -172,17 +168,18 @@ class YouTubeStatsCollector:
                 print(f"Processed video: {title} with ({views} views)")
         return pairs
 
-
     # --------------------------------------------------------------------- #
     # Orchestration + I/O
     # --------------------------------------------------------------------- #
-    def build_results(self) -> dict[str, list[list]]:
+    def build_results(self, num_channels: int, max_videos_per_channel: int) -> dict[str, list[list]]:
         """Full pipeline: discover channels → videos → `[title, views]`."""
         results: dict[str, list[list]] = {}
-        for ch_id in self.fetch_channel_ids(50, 100):
+        channel_ids = self.fetch_channel_ids(50, num_channels)
+        
+        for ch_id in channel_ids:
             print(f"Processing {ch_id} …")
             uploads_pl = self.fetch_uploads_playlist(ch_id)
-            vid_ids = self.fetch_channel_video_ids(uploads_pl)
+            vid_ids = self.fetch_channel_video_ids(uploads_pl, max_videos_per_channel)
             vid_pairs = self.fetch_video_pairs(vid_ids)
             if vid_pairs:
                 results[ch_id] = vid_pairs 
