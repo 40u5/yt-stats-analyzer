@@ -20,7 +20,7 @@ class APIKeyRotator:
 
         keys_str = os.getenv("API_KEYS", "")
         if not keys_str:
-            raise ValueError("No API_KEYS found in the environment. Please set API_KEYS in .env.")
+            raise ValueError("No API_KEYS found in the environment. Please set API_KEYS in .env")
 
         # Split on commas and strip whitespace
         self.keys = [k.strip() for k in keys_str.split(",") if k.strip()]
@@ -65,7 +65,5 @@ class APIKeyRotator:
         """Advance to the next key (wrapping around) and return it."""
         self._index = (self._index + 1) % len(self.keys)
         new_key = self.current_key()
-        print(f"[INFO] Rotated to key #{self._index}: {new_key}")
+        print(f"[INFO] Rotated to key #{self._index}")
         return new_key
-
-x = APIKeyRotator()
