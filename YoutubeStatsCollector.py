@@ -267,7 +267,7 @@ class YouTubeStatsCollector:
             print(f"Language detection error: {e}")
             return "en"
 
-    def _clean_title(self, title: str) -> str:
+    async def _clean_title(self, title: str) -> str:
         """
         Clean and normalize video title.
         
@@ -283,12 +283,13 @@ class YouTubeStatsCollector:
         # Translate if not English
         if self._detect_language(title) != "en":
             print(f"Translating title: {title}")
-            title = self.translator.translate(title, dest='en').text
+            translation = await self.translator.translate(title, dest='en')
+            title = translation.text
         
         # Clean unwanted characters
         return TITLE_CLEANUP_PATTERN.sub('', title)
 
-    def fetch_video_pairs(self, video_ids: List[str]) -> Optional[List[List]]:
+    async def fetch_video_pairs(self, video_ids: List[str]) -> Optional[List[List]]:
         """
         Fetch video titles and view counts.
         
@@ -320,7 +321,7 @@ class YouTubeStatsCollector:
 
                 for item in data["items"]:
                     raw_title = item["snippet"]["title"]
-                    cleaned_title = self._clean_title(raw_title)
+                    cleaned_title = await self._clean_title(raw_title)
                     views = int(item["statistics"].get("viewCount", 0))
                     
                     pairs.append([cleaned_title, views])
@@ -375,7 +376,7 @@ class YouTubeStatsCollector:
     # Main Pipeline
     # --------------------------------------------------------------------- #
     
-    def build_results(
+    async def build_results(
         self,
         num_channels: int,
         max_videos_per_channel: int,
@@ -422,7 +423,7 @@ class YouTubeStatsCollector:
             try:
                 uploads_playlist = self.fetch_uploads_playlist(channel_id)
                 video_ids = self.fetch_channel_video_ids(uploads_playlist, max_videos_per_channel)
-                video_pairs = self.fetch_video_pairs(video_ids)
+                video_pairs = await self.fetch_video_pairs(video_ids)
                 
                 if video_pairs:
                     results[channel_id] = video_pairs
