@@ -1,0 +1,7 @@
+requests>=2.25.0
+langdetect>=1.0.9
+googletrans==4.0.0rc1
+demoji>=1.0.0
+python-dotenv>=0.19.0
+sentence-transformers>=2.2.0
+torch>=1.9.0 

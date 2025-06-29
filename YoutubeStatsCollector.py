@@ -1,35 +1,104 @@
+"""
+YouTube Statistics Collector
+
+A tool for collecting YouTube video statistics and metadata from channels
+based on search criteria. Supports API key rotation and quota management.
+"""
+
 import json
-import requests
-from api_key_rotator import APIKeyRotator
-from langdetect import detect_langs, LangDetectException
-from googletrans import Translator
-from typing import Optional
-import demoji
+import os
 import re
+from typing import Optional, Dict, List, Tuple
+
+import demoji
+import requests
+from googletrans import Translator
+from langdetect import detect_langs, LangDetectException
+
+from api_key_rotator import APIKeyRotator
+from exceptions import QuotaExhaustedError
+
+
+# Constants
+YOUTUBE_API_BASE_URL = "https://www.googleapis.com/youtube/v3"
+BATCH_SIZE = 50
+LANGUAGE_CONFIDENCE_THRESHOLD = 0.95
+ENGLISH_PATTERN = re.compile(r'^[A-Za-z0-9\s\-\.\,\!\?\:\;\'\"\/\(\)\#\@\&\*\+\=\%\$\[\]\{\}\|\\\~\`\^\<\>\_]+$')
+TITLE_CLEANUP_PATTERN = re.compile(r'[^A-Za-z0-9\s\-\.\,\!\?\:\;\'\"\/\(\)\#\@\&\*\+\=\%\$\[\]\{\}\|\\\~\`\^\<\>\_]+')
+
+# YouTube API constants
+VALID_ORDERS = {"date", "rating", "relevance", "title", "videoCount", "viewCount"}
+VIDEO_CATEGORIES = {
+    1: "Film & Animation",
+    2: "Autos & Vehicles", 
+    10: "Music",
+    15: "Pets & Animals",
+    17: "Sports",
+    19: "Travel & Events",
+    20: "Gaming",
+    22: "People & Blogs",
+    23: "Comedy",
+    24: "Entertainment",
+    25: "News & Politics",
+    26: "Howto & Style",
+    27: "Education",
+    28: "Science & Technology",
+    29: "Nonprofits & Activism"
+}
+DURATION_MAP = ("short", "medium", "long")
+
 
 class YouTubeStatsCollector:
+    """
+    Collects YouTube video statistics and metadata from channels.
+    
+    Supports API key rotation, quota management, and automatic translation
+    of non-English video titles.
+    """
+    
     def __init__(self) -> None:
+        """Initialize the collector with API key rotation."""
         self.rotator = APIKeyRotator()
+        self.translator = Translator()
     
     # --------------------------------------------------------------------- #
-    # Internal helpers
+    # API Communication
     # --------------------------------------------------------------------- #
-    def _yt_get(self, url: str, params: dict, retries: int) -> dict:
-        """GET with automatic key-rotation on 403 errors."""
+    
+    def _make_api_request(self, endpoint: str, params: dict, retries: int) -> dict:
+        """
+        Make a YouTube API request with automatic key rotation on 403 errors.
+        
+        Args:
+            endpoint: API endpoint (e.g., 'search', 'videos')
+            params: Request parameters
+            retries: Number of retries remaining
+            
+        Returns:
+            API response data
+            
+        Raises:
+            QuotaExhaustedError: When all API keys have exhausted their quota
+        """
         if retries == 0:
-            return {}
+            raise QuotaExhaustedError("All API keys have exhausted their quota")
+            
         params["key"] = self.rotator.current_key()
-        resp = requests.get(url, params=params)
-        if resp.status_code == 403:
+        url = f"{YOUTUBE_API_BASE_URL}/{endpoint}"
+        
+        response = requests.get(url, params=params)
+        
+        if response.status_code == 403:
             self.rotator.rotate_key()
-            return self._yt_get(url, params, retries - 1)
+            return self._make_api_request(endpoint, params, retries - 1)
 
-        resp.raise_for_status()
-        return resp.json()
+        response.raise_for_status()
+        return response.json()
 
     # --------------------------------------------------------------------- #
-    # Public pipeline steps
+    # Channel Discovery
     # --------------------------------------------------------------------- #
+    
     def fetch_channel_ids(
         self,
         keywords: str,
@@ -37,17 +106,21 @@ class YouTubeStatsCollector:
         order: str,
         video_category_id: Optional[int],
         max_results_per_page: int = 50,
-        max_channels: int | None = None) -> list[str]:
+        max_channels: Optional[int] = None
+    ) -> List[str]:
         """
-        Paginate through YouTube search results and return up to `max_channels`
-        channel IDs. If max_channels is None, returns *all* channels available.
+        Fetch channel IDs from YouTube search results.
         
         Args:
-            max_results_per_page: Number of results per API call
-            max_channels: Maximum number of channels to return (None for all)
             keywords: Search keywords/query
-            video_duration: Duration filter (0=short <4min, 1=medium 4-20min, 2=long >20min)
-            language: Language code for search results
+            video_duration: Duration filter (short/medium/long)
+            order: Sort order for results
+            video_category_id: Video category filter
+            max_results_per_page: Results per API call
+            max_channels: Maximum channels to return (None for all)
+            
+        Returns:
+            List of channel IDs
         """
         params = {
             "part": "snippet",
@@ -55,243 +128,326 @@ class YouTubeStatsCollector:
             "type": "video",
             "relevanceLanguage": "en",
             "regionCode": "US",
-            "videoCategoryId": "28",
+            "videoCategoryId": str(video_category_id) if video_category_id else "28",
             "videoDuration": video_duration,
             "q": keywords,
             "maxResults": str(max_results_per_page),
         }
 
-        channels: list[str] = []
-        next_page: str | None = None
+        channels: List[str] = []
+        next_page_token: Optional[str] = None
 
         while True:
-            params["maxResults"] = str(max_results_per_page)
-            if next_page:
-                params["pageToken"] = next_page
+            if next_page_token:
+                params["pageToken"] = next_page_token
             else:
                 params.pop("pageToken", None)
 
-            data = self._yt_get(
-                "https://www.googleapis.com/youtube/v3/search",
+            data = self._make_api_request(
+                "search",
                 params=params,
-                retries=len(self.rotator.keys),
+                retries=len(self.rotator.keys)
             )
 
-            # extract this page's channel IDs
+            # Extract channel IDs from this page
             for item in data.get("items", []):
-                channels.append(item["snippet"]["channelId"])
-                # if we've hit our user‐requested limit, stop here
+                channel_id = item["snippet"]["channelId"]
+                if channel_id not in channels:  # Avoid duplicates
+                    channels.append(channel_id)
+                    
                 if max_channels and len(channels) >= max_channels:
                     return channels[:max_channels]
 
-            # see if there's another page
-            next_page = data.get("nextPageToken")
-            if not next_page:
+            # Check for next page
+            next_page_token = data.get("nextPageToken")
+            if not next_page_token:
                 break
+                
         return channels
 
     def fetch_uploads_playlist(self, channel_id: str) -> str:
-        """Return the uploads-playlist ID for a channel."""
-        print(f"Fetching uploads playlist for {channel_id} …")
-        data = self._yt_get(
-            "https://www.googleapis.com/youtube/v3/channels",
+        """
+        Get the uploads playlist ID for a channel.
+        
+        Args:
+            channel_id: YouTube channel ID
+            
+        Returns:
+            Uploads playlist ID
+        """
+        print(f"Fetching uploads playlist for {channel_id}...")
+        
+        data = self._make_api_request(
+            "channels",
             {"part": "contentDetails", "id": channel_id},
             retries=len(self.rotator.keys)
         )
+        
         return data["items"][0]["contentDetails"]["relatedPlaylists"]["uploads"]
 
-    def fetch_channel_video_ids(self, uploads_pl: str, max_videos: int) -> list[str]:
-        """Iterate through a channel's uploads playlist (paginated)."""
-        print(f"Fetching video IDs from uploads playlist {uploads_pl} …")
-        video_ids: list[str] = []
-        next_token = None
-        batch_size = 50  # Fixed batch size for API requests
+    def fetch_channel_video_ids(self, uploads_playlist: str, max_videos: int) -> List[str]:
+        """
+        Get video IDs from a channel's uploads playlist.
+        
+        Args:
+            uploads_playlist: Uploads playlist ID
+            max_videos: Maximum number of videos to fetch
+            
+        Returns:
+            List of video IDs
+        """
+        print(f"Fetching video IDs from uploads playlist {uploads_playlist}...")
+        
+        video_ids: List[str] = []
+        next_token: Optional[str] = None
 
         while len(video_ids) < max_videos:
             params = {
                 "part": "contentDetails",
-                "playlistId": uploads_pl,
-                "maxResults": batch_size,
-                "pageToken": next_token or ""
+                "playlistId": uploads_playlist,
+                "maxResults": BATCH_SIZE,
             }
-            data = self._yt_get(
-                "https://www.googleapis.com/youtube/v3/playlistItems",
+            
+            if next_token:
+                params["pageToken"] = next_token
+
+            data = self._make_api_request(
+                "playlistItems",
                 params,
                 retries=len(self.rotator.keys)
             )
-            video_ids.extend(item["contentDetails"]["videoId"]
-                             for item in data.get("items", []))
+            
+            video_ids.extend(
+                item["contentDetails"]["videoId"]
+                for item in data.get("items", [])
+            )
+            
             next_token = data.get("nextPageToken")
             if not next_token:
                 break
 
         return video_ids[:max_videos]
-    
 
-    def _get_language(self, text: str) -> str:
+    # --------------------------------------------------------------------- #
+    # Video Processing
+    # --------------------------------------------------------------------- #
+    
+    def _detect_language(self, text: str) -> str:
         """
-        Return True if `text` is detected as English with probability ≥ threshold.
-        If confidence is low, return a non-English language for translation.
-        Falls back to False on errors or low confidence.
+        Detect the language of text with confidence threshold.
+        
+        Args:
+            text: Text to analyze
+            
+        Returns:
+            Language code (e.g., 'en', 'es', etc.)
         """
-        threshold = 0.95  # Set a threshold for confidence
         try:
-            # get list of (lang, prob) sorted by prob descending
-            langs = detect_langs(text)
-            if not langs:
+            languages = detect_langs(text)
+            if not languages:
                 return "en"
-            top = langs[0]
-            # If confidence is low, find a non-English language to return
-            if top.prob < threshold:
-                # Look for the first non-English language in the results
-                for lang_obj in langs:
+                
+            top_language = languages[0]
+            
+            # If confidence is low, look for non-English alternatives
+            if top_language.prob < LANGUAGE_CONFIDENCE_THRESHOLD:
+                for lang_obj in languages:
                     if lang_obj.lang != 'en':
                         return lang_obj.lang
-                # If all detected languages are English, return the top one anyway
-                return top.lang
-            # High confidence case
-            english_pattern = re.compile(r'^[A-Za-z0-9\s\-\.\,\!\?\:\;\'\"\/\(\)\#\@\&\*\+\=\%\$\[\]\{\}\|\\\~\`\^\<\>\_]+$')
-            is_english = (top.lang == 'en' and bool(english_pattern.fullmatch(text)))
-            return "en" if is_english else top.lang
+                return top_language.lang
+            
+            # High confidence case - validate English pattern
+            is_english = (
+                top_language.lang == 'en' and 
+                bool(ENGLISH_PATTERN.fullmatch(text))
+            )
+            return "en" if is_english else top_language.lang
+            
         except LangDetectException as e:
             print(f"Language detection error: {e}")
-            return "en"  # Default to English on detection errors
+            return "en"
 
-    def fetch_video_pairs(
-            self, video_ids: list[str]
-        ) -> Optional[list[list]]:
-            """
-            For each video ID, fetches title & view count.
-            Detects the title's language; if not English, translates it using MarianMT.
-            Returns [[translated_title, view_count], …], or None on API errors.
-            """
-            try:
-                # Initialize list to store [title, view_count] pairs for each video
-                pairs: list[list] = []
-                
-                # Process videos in batches to avoid API rate limits and improve efficiency
-                batch_size = 50
-                print(f"Fetching video pairs for {len(video_ids)} videos …")
-
-                # Process video IDs in chunks to handle large lists efficiently
-                for i in range(0, len(video_ids), batch_size):
-                    # Extract current batch of video IDs
-                    chunk = video_ids[i : i + batch_size]
-                    
-                    data = self._yt_get(
-                        "https://www.googleapis.com/youtube/v3/videos",
-                        {
-                            "part": "snippet,statistics",
-                            "id": ",".join(chunk),
-                        },
-                        retries=len(self.rotator.keys)
-                    )
-
-                    if not data or "items" not in data:
-                        return None
-
-                    for item in data["items"]:
-                        raw_title = item["snippet"]["title"]
-                        title = demoji.replace(raw_title, "")  # Remove emojis from the title
-                        translator = Translator()
-                        if not self._get_language(title) == "en":
-                            # If the title is not in English, translate it
-                            print(f"Translating title: {title}")
-                            title = translator.translate(title, dest='en').text
-                        # Clean the translated title to remove unwanted characters
-                        cleaned_title = re.sub(r'[^A-Za-z0-9\s\-\.\,\!\?\:\;\'\"\/\(\)\#\@\&\*\+\=\%\$\[\]\{\}\|\\\~\`\^\<\>\_]+', '', title)
-                        # Extract view count from statistics, defaulting to 0 if not available
-                        views = int(item["statistics"].get("viewCount", 0))
-                        pairs.append([cleaned_title, views])
-                        print(f"Processed video: {cleaned_title} ({views} views)")
-                return pairs
-            except Exception as e:
-                print(f"An error occurred: {e} - discarding channel")
-                return None    
-    # --------------------------------------------------------------------- #
-    # Orchestration + I/O
-    # --------------------------------------------------------------------- #
-
-
-    def _validate_search_params(self, 
-                               keywords: str,
-                               video_duration: int,
-                               order: str,
-                               video_category_id: Optional[int]) -> tuple[str, str, Optional[int]]:
-        """Validate search parameters and return processed values."""
-        # Valid order options for YouTube Data API v3
-        valid_orders = {"date", "rating", "relevance", "title", "videoCount", "viewCount"}
-        if order not in valid_orders:
-            raise ValueError(f"order must be one of: {', '.join(sorted(valid_orders))}")
+    def _clean_title(self, title: str) -> str:
+        """
+        Clean and normalize video title.
         
-        # Valid video category IDs for YouTube Data API v3
-        valid_category_ids = {
-            1: "Film & Animation",
-            2: "Autos & Vehicles", 
-            10: "Music",
-            15: "Pets & Animals",
-            17: "Sports",
-            19: "Travel & Events",
-            20: "Gaming",
-            22: "People & Blogs",
-            23: "Comedy",
-            24: "Entertainment",
-            25: "News & Politics",
-            26: "Howto & Style",
-            27: "Education",
-            28: "Science & Technology",
-            29: "Nonprofits & Activism"
-        }
-        if video_category_id is not None and video_category_id not in valid_category_ids:
-            valid_ids = sorted(valid_category_ids.keys())
+        Args:
+            title: Raw video title
+            
+        Returns:
+            Cleaned title
+        """
+        # Remove emojis
+        title = demoji.replace(title, "")
+        
+        # Translate if not English
+        if self._detect_language(title) != "en":
+            print(f"Translating title: {title}")
+            title = self.translator.translate(title, dest='en').text
+        
+        # Clean unwanted characters
+        return TITLE_CLEANUP_PATTERN.sub('', title)
+
+    def fetch_video_pairs(self, video_ids: List[str]) -> Optional[List[List]]:
+        """
+        Fetch video titles and view counts.
+        
+        Args:
+            video_ids: List of video IDs
+            
+        Returns:
+            List of [title, view_count] pairs or None on error
+        """
+        try:
+            pairs: List[List] = []
+            print(f"Fetching video pairs for {len(video_ids)} videos...")
+
+            # Process in batches
+            for i in range(0, len(video_ids), BATCH_SIZE):
+                chunk = video_ids[i:i + BATCH_SIZE]
+                
+                data = self._make_api_request(
+                    "videos",
+                    {
+                        "part": "snippet,statistics",
+                        "id": ",".join(chunk),
+                    },
+                    retries=len(self.rotator.keys)
+                )
+
+                if not data or "items" not in data:
+                    return None
+
+                for item in data["items"]:
+                    raw_title = item["snippet"]["title"]
+                    cleaned_title = self._clean_title(raw_title)
+                    views = int(item["statistics"].get("viewCount", 0))
+                    
+                    pairs.append([cleaned_title, views])
+                    print(f"Processed video: {cleaned_title} ({views} views)")
+                    
+            return pairs
+            
+        except Exception as e:
+            print(f"Error processing videos: {e}")
+            return None
+
+    # --------------------------------------------------------------------- #
+    # Parameter Validation
+    # --------------------------------------------------------------------- #
+    
+    def _validate_search_params(
+        self, 
+        keywords: str,
+        video_duration: int,
+        order: str,
+        video_category_id: Optional[int]
+    ) -> Tuple[str, str, Optional[int]]:
+        """
+        Validate and process search parameters.
+        
+        Args:
+            keywords: Search keywords
+            video_duration: Duration type (0=short, 1=medium, 2=long)
+            order: Sort order
+            video_category_id: Category ID
+            
+        Returns:
+            Processed parameters
+            
+        Raises:
+            ValueError: For invalid parameters
+        """
+        if order not in VALID_ORDERS:
+            raise ValueError(f"order must be one of: {', '.join(sorted(VALID_ORDERS))}")
+        
+        if video_category_id is not None and video_category_id not in VIDEO_CATEGORIES:
+            valid_ids = sorted(VIDEO_CATEGORIES.keys())
             raise ValueError(f"video_category_id must be one of: {valid_ids} or None")
         
-        # Map video_duration integer to YouTube API duration strings
-        duration_map = ("short", "medium", "long")
         if video_duration not in [0, 1, 2]:
             raise ValueError("video_duration must be 0 (short), 1 (medium), or 2 (long)")
         
-        processed_duration = duration_map[video_duration]
+        processed_duration = DURATION_MAP[video_duration]
         return keywords, processed_duration, video_category_id
 
-
-
-
-
-    def build_results(self,
-                       num_channels: int,
-                        max_videos_per_channel: int,
-                        keywords: str = "technology",
-                        duration_type: int = 1,
-                        order: str = "relevance",
-                        video_category_id: Optional[int] = None
-                         ) -> dict[str, list[list]]:
-        """Full pipeline: discover channels → videos → `[title, views]`."""
-        duration_list = ["short", "medium", "long"]
-        video_duration = duration_list[duration_type] if duration_type in (0, 1, 2) else "short"
-        results: dict[str, list[list]] = {}
-        channel_ids = self.fetch_channel_ids(
-            keywords=keywords,
-            video_duration=video_duration,
-            order=order,
-            video_category_id=video_category_id,
-            max_results_per_page=50,
-            max_channels=num_channels
+    # --------------------------------------------------------------------- #
+    # Main Pipeline
+    # --------------------------------------------------------------------- #
+    
+    def build_results(
+        self,
+        num_channels: int,
+        max_videos_per_channel: int,
+        keywords: str = "technology",
+        duration_type: int = 1,
+        order: str = "relevance",
+        video_category_id: Optional[int] = None
+    ) -> Dict[str, List[List]]:
+        """
+        Execute the full data collection pipeline.
+        
+        Args:
+            num_channels: Number of channels to process
+            max_videos_per_channel: Max videos per channel
+            keywords: Search keywords
+            duration_type: Video duration filter
+            order: Sort order
+            video_category_id: Category filter
+            
+        Returns:
+            Dictionary mapping channel IDs to video data
+        """
+        _, video_duration, video_category_id = self._validate_search_params(
+            keywords, duration_type, order, video_category_id
         )
+        
+        results: Dict[str, List[List]] = {}
+        
+        try:
+            channel_ids = self.fetch_channel_ids(
+                keywords=keywords,
+                video_duration=video_duration,
+                order=order,
+                video_category_id=video_category_id,
+                max_channels=num_channels
+            )
+        except QuotaExhaustedError:
+            print("API quota exhausted while fetching channel IDs. Saving partial results.")
+            self.save_to_json(results)
+            raise
 
-        for ch_id in channel_ids:
-            print(f"Processing {ch_id} …")
-            uploads_pl = self.fetch_uploads_playlist(ch_id)
-            vid_ids = self.fetch_channel_video_ids(uploads_pl, max_videos_per_channel)
-            vid_pairs = self.fetch_video_pairs(vid_ids)
-            if vid_pairs:
-                results[ch_id] = vid_pairs
+        for channel_id in channel_ids:
+            print(f"Processing channel {channel_id}...")
+            try:
+                uploads_playlist = self.fetch_uploads_playlist(channel_id)
+                video_ids = self.fetch_channel_video_ids(uploads_playlist, max_videos_per_channel)
+                video_pairs = self.fetch_video_pairs(video_ids)
+                
+                if video_pairs:
+                    results[channel_id] = video_pairs
+                    
+            except QuotaExhaustedError:
+                print(f"API quota exhausted while processing channel {channel_id}. Saving partial results.")
+                self.save_to_json(results)
+                raise
+                
         return results
 
-    def save_to_json(self, results: dict, path: str = "results.json") -> None:
-        """Dump the results as pretty-printed JSON, merging with existing data if file exists."""
-        import os
-        import json
+    # --------------------------------------------------------------------- #
+    # Data Persistence
+    # --------------------------------------------------------------------- #
+    
+    def save_to_json(self, results: Dict, path: str = "data/results.json") -> None:
+        """
+        Save results to JSON file, merging with existing data.
+        
+        Args:
+            results: Data to save
+            path: Output file path (defaults to data/results.json)
+        """
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         
         existing_data = {}
         
@@ -303,57 +459,39 @@ class YouTubeStatsCollector:
             except (json.JSONDecodeError, IOError):
                 existing_data = {}
         
-        # Check for duplicate keys (optional - depending on your needs)
+        # Check for duplicates
         duplicate_keys = set(existing_data.keys()) & set(results.keys())
         if duplicate_keys:
             print(f"Warning: Overwriting existing keys: {duplicate_keys}")
         
-        # Merge new results with existing data
+        # Merge and save
         existing_data.update(results)
         
-        # Write the combined data back to file (use 'w' not 'a')
         with open(path, "w", encoding="utf-8") as f:
             json.dump(existing_data, f, ensure_ascii=False, indent=2)
-        print(f"Wrote {path}")    
+            
+        print(f"Saved {len(results)} channels to {path}")
 
-    def get_sub_counts(self, channel_ids: list[str]) -> dict[str, int]:
+    def get_subscriber_counts(self, channel_ids: List[str]) -> Dict[str, int]:
         """
-        Fetch subscriber counts for a list of channel IDs.
+        Fetch subscriber counts for channels.
         
         Args:
-            channel_ids: List of YouTube channel IDs to fetch subscriber counts for.
-        
+            channel_ids: List of channel IDs
+            
         Returns:
-            Dictionary mapping channel IDs to their subscriber counts.
+            Dictionary mapping channel IDs to subscriber counts
         """
-        params = {
-            "part": "statistics",
-            "id": ",".join(channel_ids)
-        }
-        data = self._yt_get(
-            "https://www.googleapis.com/youtube/v3/channels",
-            params,
+        data = self._make_api_request(
+            "channels",
+            {
+                "part": "statistics",
+                "id": ",".join(channel_ids)
+            },
             retries=len(self.rotator.keys)
         )
         
-        sub_counts = {}
-        for item in data.get("items", []):
-            sub_counts[item["id"]] = int(item["statistics"].get("subscriberCount", 0))
-        
-        return sub_counts
-
-
-# ------------------------------------------------------------------------- #
-# CLI entry-point
-# ------------------------------------------------------------------------- #
-if __name__ == "__main__":
-    fetcher = YouTubeStatsCollector()
-    data = fetcher.build_results(
-        num_channels=950,
-        max_videos_per_channel=10,
-        keywords="AI",
-        duration_type=1,
-        order="relevance",
-        video_category_id=28
-    )
-    fetcher.save_to_json(data, path="results.json")
+        return {
+            item["id"]: int(item["statistics"].get("subscriberCount", 0))
+            for item in data.get("items", [])
+        }
