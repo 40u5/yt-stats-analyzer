@@ -8,15 +8,17 @@ based on search criteria. Supports API key rotation and quota management.
 import json
 import os
 import re
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List, Tuple, Union
 
 import demoji
 import requests
+from requests.adapters import HTTPAdapter
 from googletrans import Translator
 from langdetect import detect_langs, LangDetectException
 
 from api_key_rotator import APIKeyRotator
 from exceptions import QuotaExhaustedError
+from WeaviateEmbedder import WeaviateEmbedder
 
 
 # Constants
@@ -60,6 +62,20 @@ class YouTubeStatsCollector:
         """Initialize the collector with API key rotation."""
         self.rotator = APIKeyRotator()
         self.translator = Translator()
+        self.embedder = WeaviateEmbedder()
+        # Create a session for better connection management
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'YouTube-Stats-Collector/1.0'
+        })
+        # Configure session for better connection handling
+        adapter = HTTPAdapter(
+            pool_connections=10,
+            pool_maxsize=10,
+            max_retries=3
+        )
+        self.session.mount('http://', adapter)
+        self.session.mount('https://', adapter)
     
     # --------------------------------------------------------------------- #
     # API Communication
@@ -86,14 +102,18 @@ class YouTubeStatsCollector:
         params["key"] = self.rotator.current_key()
         url = f"{YOUTUBE_API_BASE_URL}/{endpoint}"
         
-        response = requests.get(url, params=params)
-        
-        if response.status_code == 403:
-            self.rotator.rotate_key()
-            return self._make_api_request(endpoint, params, retries - 1)
+        try:
+            response = self.session.get(url, params=params, timeout=30)
+            
+            if response.status_code == 403:
+                self.rotator.rotate_key()
+                return self._make_api_request(endpoint, params, retries - 1)
 
-        response.raise_for_status()
-        return response.json()
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            print(f"Request error: {e}")
+            raise
 
     # --------------------------------------------------------------------- #
     # Channel Discovery
@@ -117,50 +137,103 @@ class YouTubeStatsCollector:
             order: Sort order for results
             video_category_id: Video category filter
             max_results_per_page: Results per API call
-            max_channels: Maximum channels to return (None for all)
+            max_channels: Maximum channels to return (None for infinite collection)
             
         Returns:
             List of channel IDs
         """
-        params = {
-            "part": "snippet",
-            "order": order,
-            "type": "video",
-            "relevanceLanguage": "en",
-            "regionCode": "US",
-            "videoCategoryId": str(video_category_id) if video_category_id else "28",
-            "videoDuration": video_duration,
-            "q": keywords,
-            "maxResults": str(max_results_per_page),
-        }
-
         channels: List[str] = []
-        next_page_token: Optional[str] = None
+        page_count = 0
+        search_attempts = 0
+        max_search_attempts = 10  # Limit to prevent infinite loops
+
+        print(f"🔍 Searching for channels with keywords: '{keywords}'")
+        if max_channels is None:
+            print("♾️  Infinite mode: collecting all available channels")
+        else:
+            print(f"📊 Target: collecting up to {max_channels} channels")
+
+        # For infinite mode, we'll try different search strategies to maximize channel discovery
+        search_strategies = [
+            {"order": order, "videoDuration": video_duration},
+            {"order": "date", "videoDuration": video_duration},
+            {"order": "viewCount", "videoDuration": video_duration},
+            {"order": "rating", "videoDuration": video_duration},
+            {"order": order, "videoDuration": "short"},
+            {"order": order, "videoDuration": "medium"},
+            {"order": order, "videoDuration": "long"},
+            {"order": "relevance", "videoDuration": video_duration},
+            {"order": "title", "videoDuration": video_duration},
+        ]
 
         while True:
-            if next_page_token:
-                params["pageToken"] = next_page_token
+            # Select search strategy for this attempt
+            strategy = search_strategies[search_attempts % len(search_strategies)]
+            
+            params = {
+                "part": "snippet",
+                "type": "video",
+                "relevanceLanguage": "en",
+                "regionCode": "US",
+                "videoCategoryId": str(video_category_id) if video_category_id else "28",
+                "q": keywords,
+                "maxResults": str(max_results_per_page),
+                **strategy
+            }
+
+            next_page_token: Optional[str] = None
+            page_count = 0
+
+            print(f"🔄 Search attempt {search_attempts + 1}: order={strategy['order']}, duration={strategy['videoDuration']}")
+            print(f"📊 Current total channels found: {len(channels)}")
+
+            while True:
+                page_count += 1
+                if next_page_token:
+                    params["pageToken"] = next_page_token
+                else:
+                    params.pop("pageToken", None)
+
+                print(f"📄 Fetching page {page_count}...")
+                try:
+                    data = self._make_api_request(
+                        "search",
+                        params=params,
+                        retries=len(self.rotator.keys)
+                    )
+                except Exception as e:
+                    print(f"❌ Error in search attempt {search_attempts + 1}: {e}")
+                    break
+
+                # Extract channel IDs from this page
+                new_channels_on_page = 0
+                for item in data.get("items", []):
+                    channel_id = item["snippet"]["channelId"]
+                    if channel_id not in channels:  # Avoid duplicates
+                        channels.append(channel_id)
+                        new_channels_on_page += 1
+                        
+                    if max_channels and len(channels) >= max_channels:
+                        print(f"✅ Reached target of {max_channels} channels")
+                        return channels[:max_channels]
+
+                print(f"  Found {new_channels_on_page} new channels on page {page_count} (total: {len(channels)})")
+
+                # Check for next page
+                next_page_token = data.get("nextPageToken")
+                if not next_page_token:
+                    print(f"🏁 No more pages for this search strategy. Total channels found: {len(channels)}")
+                    break
+
+            # If we're in infinite mode and haven't reached max attempts, try next strategy
+            if max_channels is None:
+                search_attempts += 1
+                if search_attempts >= max_search_attempts:
+                    print(f"🛑 Reached maximum search attempts ({max_search_attempts}). Stopping infinite collection.")
+                    break
+                print(f"🔄 Trying next search strategy... (attempt {search_attempts + 1}/{max_search_attempts})")
             else:
-                params.pop("pageToken", None)
-
-            data = self._make_api_request(
-                "search",
-                params=params,
-                retries=len(self.rotator.keys)
-            )
-
-            # Extract channel IDs from this page
-            for item in data.get("items", []):
-                channel_id = item["snippet"]["channelId"]
-                if channel_id not in channels:  # Avoid duplicates
-                    channels.append(channel_id)
-                    
-                if max_channels and len(channels) >= max_channels:
-                    return channels[:max_channels]
-
-            # Check for next page
-            next_page_token = data.get("nextPageToken")
-            if not next_page_token:
+                # For finite mode, stop when we run out of pages
                 break
                 
         return channels
@@ -378,101 +451,93 @@ class YouTubeStatsCollector:
     
     async def build_results(
         self,
-        num_channels: int,
+        num_channels: Union[int, bool],
         max_videos_per_channel: int,
         keywords: str = "technology",
         duration_type: int = 1,
         order: str = "relevance",
-        video_category_id: Optional[int] = None
-    ) -> Dict[str, List[List]]:
+        video_category_id: Optional[int] = None, 
+        write_to_weaviate: bool = False
+    ) -> dict:
         """
-        Execute the full data collection pipeline.
-        
-        Args:
-            num_channels: Number of channels to process
-            max_videos_per_channel: Max videos per channel
-            keywords: Search keywords
-            duration_type: Video duration filter
-            order: Sort order
-            video_category_id: Category filter
-            
-        Returns:
-            Dictionary mapping channel IDs to video data
+        Execute the full data collection pipeline, embed directly to Weaviate, and return results.
         """
         _, video_duration, video_category_id = self._validate_search_params(
             keywords, duration_type, order, video_category_id
         )
         
-        results: Dict[str, List[List]] = {}
+        # Handle infinite collection when num_channels is True
+        infinite_mode = num_channels is True
+        max_channels = None if infinite_mode else num_channels
         
         try:
+            # get list of channel ids
             channel_ids = self.fetch_channel_ids(
                 keywords=keywords,
                 video_duration=video_duration,
                 order=order,
                 video_category_id=video_category_id,
-                max_channels=num_channels
+                max_channels=max_channels
             )
         except QuotaExhaustedError:
-            print("API quota exhausted while fetching channel IDs. Saving partial results.")
-            self.save_to_json(results)
+            print("API quota exhausted while fetching channel IDs. Stopping.")
             raise
-
-        for channel_id in channel_ids:
-            print(f"Processing channel {channel_id}...")
+        
+        results: Dict[str, Union[int, List[List]]] = {}
+        total_channels = 0
+        total_videos = 0
+        
+        if infinite_mode:
+            print("🔄 Infinite mode enabled - collecting all available channels...")
+            print("💡 The system will try multiple search strategies to find more channels")
+        
+        for i, channel_id in enumerate(channel_ids, 1):
+            print(f"\n📺 Processing channel {i}/{len(channel_ids)}: {channel_id}")
             try:
                 uploads_playlist = self.fetch_uploads_playlist(channel_id)
                 video_ids = self.fetch_channel_video_ids(uploads_playlist, max_videos_per_channel)
                 video_pairs = await self.fetch_video_pairs(video_ids)
                 
                 if video_pairs:
-                    results[channel_id] = video_pairs
-                    
+                    total_channels += 1
+                    total_videos += len(video_ids)
+                    # Fetch subscriber count for this channel
+                    if write_to_weaviate:
+                        subscriber_count = self.get_subscriber_counts([channel_id]).get(channel_id, 0)
+                        self.embedder.embed_videos_for_channel(channel_id, subscriber_count, video_pairs)
+                    else:
+                        results[channel_id] = video_pairs
+                        
+                    if infinite_mode:
+                        print(f"📊 Progress: {total_channels} channels, {total_videos} videos processed")
+                        if i % 10 == 0:  # Show detailed progress every 10 channels
+                            print(f"🎯 Current batch: {i}/{len(channel_ids)} channels completed")
+                        
             except QuotaExhaustedError:
-                print(f"API quota exhausted while processing channel {channel_id}. Saving partial results.")
-                self.save_to_json(results)
+                print(f"❌ API quota exhausted while processing channel {channel_id}. Stopping.")
+                print(f"📈 Final stats: {total_channels} channels, {total_videos} videos processed")
                 raise
-                
+            except Exception as e:
+                print(f"⚠️  Error processing channel {channel_id}: {e}")
+                print("Continuing with next channel...")
+                continue
+        
+        results['total_channels'] = total_channels
+        results['total_videos'] = total_videos
+        
+        if infinite_mode:
+            print(f"\n✅ Infinite collection completed!")
+            print(f"📊 Final stats: {total_channels} channels, {total_videos} videos embedded into Weaviate")
+            print(f"🎯 Successfully processed {len(channel_ids)} unique channels")
+        else:
+            print(f"\n✅ Collection completed!")
+            print(f"📊 Final stats: {total_channels} channels, {total_videos} videos embedded into Weaviate")
         return results
 
     # --------------------------------------------------------------------- #
     # Data Persistence
     # --------------------------------------------------------------------- #
     
-    def save_to_json(self, results: Dict, path: str = "data/results.json") -> None:
-        """
-        Save results to JSON file, merging with existing data.
-        
-        Args:
-            results: Data to save
-            path: Output file path (defaults to data/results.json)
-        """
-        # Ensure directory exists
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        
-        existing_data = {}
-        
-        # Load existing data if file exists
-        if os.path.exists(path):
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    existing_data = json.load(f)
-            except (json.JSONDecodeError, IOError):
-                existing_data = {}
-        
-        # Check for duplicates
-        duplicate_keys = set(existing_data.keys()) & set(results.keys())
-        if duplicate_keys:
-            print(f"Warning: Overwriting existing keys: {duplicate_keys}")
-        
-        # Merge and save
-        existing_data.update(results)
-        
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(existing_data, f, ensure_ascii=False, indent=2)
-            
-        print(f"Saved {len(results)} channels to {path}")
-
     def get_subscriber_counts(self, channel_ids: List[str]) -> Dict[str, int]:
         """
         Fetch subscriber counts for channels.
@@ -496,3 +561,47 @@ class YouTubeStatsCollector:
             item["id"]: int(item["statistics"].get("subscriberCount", 0))
             for item in data.get("items", [])
         }
+
+    def embed_channel_weaviate(self, channel_id: str, subscriber_count: int, video_pairs: list) -> int:
+        """
+        Embed a list of videos for a channel directly into Weaviate.
+        
+        Args:
+            channel_id: The YouTube channel ID
+            subscriber_count: The number of subscribers for the channel
+            video_pairs: List of [title, view_count] pairs for the channel's videos
+        
+        Returns:
+            Number of new videos embedded
+        """
+        return self.embedder.embed_videos_for_channel(channel_id, subscriber_count, video_pairs)
+    
+    async def aclose(self):
+        """Properly close all resources including async clients."""
+        print("🧹 Starting resource cleanup...")
+        
+        # 1) shut down your requests.Session
+        if hasattr(self, 'session'):
+            self.session.close()
+            print("  ✅ Requests session closed")
+
+        # 2) if googletrans created an HTTPX AsyncClient, close it
+        client = getattr(self.translator, 'client', None)
+        if client is not None and hasattr(client, 'aclose'):
+            try:
+                await client.aclose()
+                print("  ✅ Google Translate client closed")
+            except Exception as e:
+                print(f"  ⚠️  Warning: Error closing Google Translate client: {e}")
+        else:
+            print("  ℹ️  No Google Translate client to close")
+
+        # 3) for the embedder, just call its existing sync close()
+        if hasattr(self.embedder, 'close'):
+            try:
+                self.embedder.close()
+                print("  ✅ Weaviate embedder closed")
+            except Exception as e:
+                print(f"  ⚠️  Warning: Error closing Weaviate embedder: {e}")
+        
+        print("🧹 Resource cleanup completed")
