@@ -6,12 +6,7 @@ This script runs the Weaviate embedding process to load YouTube data
 into the vector database for semantic search.
 """
 
-import logging
 from WeaviateEmbedder import WeaviateEmbedder
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 def main():
     """Main function to run the embedding process."""
@@ -23,7 +18,7 @@ def main():
     
     try:
         # Embed data incrementally (won't delete existing data)
-        total_videos_embedded = embedder.embed_data(FILE_PATH, force_recreate=False)
+        total_videos_embedded = embedder.embed_data(FILE_PATH, force_recreate=True)
         
         # Get stats
         total_videos = embedder.get_stats()
@@ -47,7 +42,7 @@ def main():
         # embedder.embed_data("data/r.json", force_recreate=True)
         
     except Exception as e:
-        logger.error(f"Error in main process: {e}")
+        print(f"Error in main process: {e}")
         raise
     finally:
         # Always close the connection

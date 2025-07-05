@@ -126,117 +126,47 @@ class YouTubeStatsCollector:
         order: str,
         video_category_id: Optional[int],
         max_results_per_page: int = 50,
-        max_channels: Optional[int] = None
-    ) -> List[str]:
+        page_token: Optional[str] = None
+    ) -> Tuple[List[str], Optional[str]]:
         """
-        Fetch channel IDs from YouTube search results.
-        
+        Fetch a single page of channel IDs from YouTube search results.
         Args:
             keywords: Search keywords/query
             video_duration: Duration filter (short/medium/long)
             order: Sort order for results
             video_category_id: Video category filter
             max_results_per_page: Results per API call
-            max_channels: Maximum channels to return (None for infinite collection)
-            
+            page_token: Token for the next page (None for first page)
         Returns:
-            List of channel IDs
+            Tuple of (list of channel IDs, nextPageToken or None)
         """
-        channels: List[str] = []
-        page_count = 0
-        search_attempts = 0
-        max_search_attempts = 10  # Limit to prevent infinite loops
-
-        print(f"🔍 Searching for channels with keywords: '{keywords}'")
-        if max_channels is None:
-            print("♾️  Infinite mode: collecting all available channels")
-        else:
-            print(f"📊 Target: collecting up to {max_channels} channels")
-
-        # For infinite mode, we'll try different search strategies to maximize channel discovery
-        search_strategies = [
-            {"order": order, "videoDuration": video_duration},
-            {"order": "date", "videoDuration": video_duration},
-            {"order": "viewCount", "videoDuration": video_duration},
-            {"order": "rating", "videoDuration": video_duration},
-            {"order": order, "videoDuration": "short"},
-            {"order": order, "videoDuration": "medium"},
-            {"order": order, "videoDuration": "long"},
-            {"order": "relevance", "videoDuration": video_duration},
-            {"order": "title", "videoDuration": video_duration},
-        ]
-
-        while True:
-            # Select search strategy for this attempt
-            strategy = search_strategies[search_attempts % len(search_strategies)]
-            
-            params = {
-                "part": "snippet",
-                "type": "video",
-                "relevanceLanguage": "en",
-                "regionCode": "US",
-                "videoCategoryId": str(video_category_id) if video_category_id else "28",
-                "q": keywords,
-                "maxResults": str(max_results_per_page),
-                **strategy
-            }
-
-            next_page_token: Optional[str] = None
-            page_count = 0
-
-            print(f"🔄 Search attempt {search_attempts + 1}: order={strategy['order']}, duration={strategy['videoDuration']}")
-            print(f"📊 Current total channels found: {len(channels)}")
-
-            while True:
-                page_count += 1
-                if next_page_token:
-                    params["pageToken"] = next_page_token
-                else:
-                    params.pop("pageToken", None)
-
-                print(f"📄 Fetching page {page_count}...")
-                try:
-                    data = self._make_api_request(
-                        "search",
-                        params=params,
-                        retries=len(self.rotator.keys)
-                    )
-                except Exception as e:
-                    print(f"❌ Error in search attempt {search_attempts + 1}: {e}")
-                    break
-
-                # Extract channel IDs from this page
-                new_channels_on_page = 0
-                for item in data.get("items", []):
-                    channel_id = item["snippet"]["channelId"]
-                    if channel_id not in channels:  # Avoid duplicates
-                        channels.append(channel_id)
-                        new_channels_on_page += 1
-                        
-                    if max_channels and len(channels) >= max_channels:
-                        print(f"✅ Reached target of {max_channels} channels")
-                        return channels[:max_channels]
-
-                print(f"  Found {new_channels_on_page} new channels on page {page_count} (total: {len(channels)})")
-
-                # Check for next page
-                next_page_token = data.get("nextPageToken")
-                if not next_page_token:
-                    print(f"🏁 No more pages for this search strategy. Total channels found: {len(channels)}")
-                    break
-
-            # If we're in infinite mode and haven't reached max attempts, try next strategy
-            if max_channels is None:
-                search_attempts += 1
-                if search_attempts >= max_search_attempts:
-                    print(f"🛑 Reached maximum search attempts ({max_search_attempts}). Stopping infinite collection.")
-                    break
-                print(f"🔄 Trying next search strategy... (attempt {search_attempts + 1}/{max_search_attempts})")
-            else:
-                # For finite mode, stop when we run out of pages
-                break
-                
-        return channels
+        params = {
+            "part": "snippet",
+            "type": "video",
+            "relevanceLanguage": "en",
+            "regionCode": "US",
+            "videoCategoryId": str(video_category_id) if video_category_id else "28",
+            "q": keywords,
+            "maxResults": str(max_results_per_page),
+            "order": order,
+            "videoDuration": video_duration,
+        }
+        if page_token:
+            params["pageToken"] = page_token
+        print(f"🔍 Fetching channel page (order={order}, duration={video_duration}, page_token={page_token})")
+        data = self._make_api_request(
+            "search",
+            params=params,
+            retries=len(self.rotator.keys)
+        )
+        channel_ids = []
+        for item in data.get("items", []):
+            channel_id = item["snippet"]["channelId"]
+            if channel_id not in channel_ids:
+                channel_ids.append(channel_id)
+        next_page_token = data.get("nextPageToken")
+        print(f"  Found {len(channel_ids)} channels on this page. Next page token: {next_page_token}")
+        return channel_ids, next_page_token
 
     def fetch_uploads_playlist(self, channel_id: str) -> str:
         """
@@ -374,7 +304,7 @@ class YouTubeStatsCollector:
         """
         try:
             pairs: List[List] = []
-            print(f"Fetching video pairs for {len(video_ids)} videos...")
+            print(f"Fetching video data for {len(video_ids)} videos...")
 
             # Process in batches
             for i in range(0, len(video_ids), BATCH_SIZE):
@@ -398,8 +328,9 @@ class YouTubeStatsCollector:
                     views = int(item["statistics"].get("viewCount", 0))
                     
                     pairs.append([cleaned_title, views])
-                    print(f"Processed video: {cleaned_title} ({views} views)")
+                    print(f"  📹 {cleaned_title} ({views:,} views)")
                     
+            print(f"Fetched data for {len(pairs)} videos")
             return pairs
             
         except Exception as e:
@@ -461,77 +392,120 @@ class YouTubeStatsCollector:
     ) -> dict:
         """
         Execute the full data collection pipeline, embed directly to Weaviate, and return results.
+        In infinite mode, fetch and process one page at a time, writing videos to weaviate, and continue with the next page until done.
         """
         _, video_duration, video_category_id = self._validate_search_params(
             keywords, duration_type, order, video_category_id
         )
-        
-        # Handle infinite collection when num_channels is True
         infinite_mode = num_channels is True
         max_channels = None if infinite_mode else num_channels
-        
-        try:
-            # get list of channel ids
-            channel_ids = self.fetch_channel_ids(
-                keywords=keywords,
-                video_duration=video_duration,
-                order=order,
-                video_category_id=video_category_id,
-                max_channels=max_channels
-            )
-        except QuotaExhaustedError:
-            print("API quota exhausted while fetching channel IDs. Stopping.")
-            raise
-        
         results: Dict[str, Union[int, List[List]]] = {}
         total_channels = 0
         total_videos = 0
-        
         if infinite_mode:
-            print("🔄 Infinite mode enabled - collecting all available channels...")
-            print("💡 The system will try multiple search strategies to find more channels")
-        
-        for i, channel_id in enumerate(channel_ids, 1):
-            print(f"\n📺 Processing channel {i}/{len(channel_ids)}: {channel_id}")
-            try:
-                uploads_playlist = self.fetch_uploads_playlist(channel_id)
-                video_ids = self.fetch_channel_video_ids(uploads_playlist, max_videos_per_channel)
-                video_pairs = await self.fetch_video_pairs(video_ids)
-                
-                if video_pairs:
-                    total_channels += 1
-                    total_videos += len(video_ids)
-                    # Fetch subscriber count for this channel
-                    if write_to_weaviate:
-                        subscriber_count = self.get_subscriber_counts([channel_id]).get(channel_id, 0)
-                        self.embedder.embed_videos_for_channel(channel_id, subscriber_count, video_pairs)
-                    else:
-                        results[channel_id] = video_pairs
-                        
-                    if infinite_mode:
-                        print(f"📊 Progress: {total_channels} channels, {total_videos} videos processed")
-                        if i % 10 == 0:  # Show detailed progress every 10 channels
-                            print(f"🎯 Current batch: {i}/{len(channel_ids)} channels completed")
-                        
-            except QuotaExhaustedError:
-                print(f"❌ API quota exhausted while processing channel {channel_id}. Stopping.")
-                print(f"📈 Final stats: {total_channels} channels, {total_videos} videos processed")
-                raise
-            except Exception as e:
-                print(f"⚠️  Error processing channel {channel_id}: {e}")
-                print("Continuing with next channel...")
-                continue
-        
-        results['total_channels'] = total_channels
-        results['total_videos'] = total_videos
-        
-        if infinite_mode:
+            print("🔄 Infinite mode enabled - collecting all available channels (one page at a time)...")
+            page_token = None
+            while True:
+                try:
+                    channel_ids, next_page_token = self.fetch_channel_ids(
+                        keywords=keywords,
+                        video_duration=video_duration,
+                        order=order,
+                        video_category_id=video_category_id,
+                        page_token=page_token
+                    )
+                except QuotaExhaustedError:
+                    print("API quota exhausted while fetching channel IDs. Stopping.")
+                    break
+                if not channel_ids:
+                    print("No more channels found on this page. Stopping.")
+                    break
+                for channel_id in channel_ids:
+                    print(f"\n📺 Processing channel: {channel_id}")
+                    try:
+                        uploads_playlist = self.fetch_uploads_playlist(channel_id)
+                        video_ids = self.fetch_channel_video_ids(uploads_playlist, max_videos_per_channel)
+                        video_pairs = await self.fetch_video_pairs(video_ids)
+                        if video_pairs:
+                            total_channels += 1
+                            if write_to_weaviate:
+                                subscriber_count = self.get_subscriber_counts([channel_id]).get(channel_id, 0)
+                                videos_embedded = self.embedder.embed_videos_for_channel(channel_id, subscriber_count, video_pairs)
+                                total_videos += videos_embedded
+                            else:
+                                results[channel_id] = video_pairs
+                                total_videos += len(video_ids)
+                            if write_to_weaviate:
+                                print(f"📊 Progress: {total_channels} channels, {total_videos} new videos embedded")
+                            else:
+                                print(f"📊 Progress: {total_channels} channels, {total_videos} videos processed")
+                    except QuotaExhaustedError:
+                        print(f"❌ API quota exhausted while processing channel {channel_id}. Stopping.")
+                        print(f"📈 Final stats: {total_channels} channels, {total_videos} videos processed")
+                        return results
+                    except Exception as e:
+                        print(f"⚠️  Error processing channel {channel_id}: {e}")
+                        print("Continuing with next channel...")
+                        continue
+                if not next_page_token:
+                    print(f"\n✅ All pages processed!")
+                    break
+                page_token = next_page_token
+            results['total_channels'] = total_channels
+            results['total_videos'] = total_videos
             print(f"\n✅ Infinite collection completed!")
-            print(f"📊 Final stats: {total_channels} channels, {total_videos} videos embedded into Weaviate")
-            print(f"🎯 Successfully processed {len(channel_ids)} unique channels")
+            if write_to_weaviate:
+                print(f"📊 Final stats: {total_channels} channels, {total_videos} new videos embedded into Weaviate")
+            else:
+                print(f"📊 Final stats: {total_channels} channels, {total_videos} videos processed")
         else:
+            try:
+                # Ensure max_results_per_page is a valid int (YouTube API max is 50)
+                max_results_per_page = 50 if not isinstance(max_channels, int) or max_channels is None or max_channels > 50 else max_channels
+                channel_ids, _ = self.fetch_channel_ids(
+                    keywords=keywords,
+                    video_duration=video_duration,
+                    order=order,
+                    video_category_id=video_category_id,
+                    max_results_per_page=max_results_per_page
+                )
+            except QuotaExhaustedError:
+                print("API quota exhausted while fetching channel IDs. Stopping.")
+                raise
+            for i, channel_id in enumerate(channel_ids, 1):
+                print(f"\n📺 Processing channel {i}/{len(channel_ids)}: {channel_id}")
+                try:
+                    uploads_playlist = self.fetch_uploads_playlist(channel_id)
+                    video_ids = self.fetch_channel_video_ids(uploads_playlist, max_videos_per_channel)
+                    video_pairs = await self.fetch_video_pairs(video_ids)
+                    if video_pairs:
+                        total_channels += 1
+                        if write_to_weaviate:
+                            subscriber_count = self.get_subscriber_counts([channel_id]).get(channel_id, 0)
+                            videos_embedded = self.embedder.embed_videos_for_channel(channel_id, subscriber_count, video_pairs)
+                            total_videos += videos_embedded
+                        else:
+                            results[channel_id] = video_pairs
+                            total_videos += len(video_ids)
+                        if write_to_weaviate:
+                            print(f"📊 Progress: {total_channels} channels, {total_videos} new videos embedded")
+                        else:
+                            print(f"📊 Progress: {total_channels} channels, {total_videos} videos processed")
+                except QuotaExhaustedError:
+                    print(f"❌ API quota exhausted while processing channel {channel_id}. Stopping.")
+                    print(f"📈 Final stats: {total_channels} channels, {total_videos} videos processed")
+                    raise
+                except Exception as e:
+                    print(f"⚠️  Error processing channel {channel_id}: {e}")
+                    print("Continuing with next channel...")
+                    continue
+            results['total_channels'] = total_channels
+            results['total_videos'] = total_videos
             print(f"\n✅ Collection completed!")
-            print(f"📊 Final stats: {total_channels} channels, {total_videos} videos embedded into Weaviate")
+            if write_to_weaviate:
+                print(f"📊 Final stats: {total_channels} channels, {total_videos} new videos embedded into Weaviate")
+            else:
+                print(f"📊 Final stats: {total_channels} channels, {total_videos} videos processed")
         return results
 
     # --------------------------------------------------------------------- #
@@ -561,20 +535,6 @@ class YouTubeStatsCollector:
             item["id"]: int(item["statistics"].get("subscriberCount", 0))
             for item in data.get("items", [])
         }
-
-    def embed_channel_weaviate(self, channel_id: str, subscriber_count: int, video_pairs: list) -> int:
-        """
-        Embed a list of videos for a channel directly into Weaviate.
-        
-        Args:
-            channel_id: The YouTube channel ID
-            subscriber_count: The number of subscribers for the channel
-            video_pairs: List of [title, view_count] pairs for the channel's videos
-        
-        Returns:
-            Number of new videos embedded
-        """
-        return self.embedder.embed_videos_for_channel(channel_id, subscriber_count, video_pairs)
     
     async def aclose(self):
         """Properly close all resources including async clients."""

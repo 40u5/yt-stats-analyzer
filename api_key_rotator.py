@@ -24,7 +24,7 @@ class APIKeyRotator:
         self._index = 0
         self._key_usage = {key: 0 for key in self.keys}
         
-        self.logger.info(f"Initialized API key rotator with {len(self.keys)} keys")
+        print(f"Initialized API key rotator with {len(self.keys)} keys")
 
     def _load_keys(self) -> List[str]:
         """
@@ -67,7 +67,7 @@ class APIKeyRotator:
         until typing 'exit', then write them into a .env file as:
             API_KEYS=key1,key2,...
         """
-        self.logger.info(f"'{env_path}' not found. Creating it with your API keys.")
+        print(f"'{env_path}' not found. Creating it with your API keys.")
         keys = []
         i = 1
         while True:
@@ -94,7 +94,7 @@ class APIKeyRotator:
         try:
             with open(env_path, 'w') as f:
                 f.write(f"API_KEYS={','.join(keys)}\n")
-            self.logger.info(f"Created '{env_path}' with {len(keys)} key(s).")
+            print(f"Created '{env_path}' with {len(keys)} key(s).")
         except PermissionError:
             raise PermissionError(f"Cannot write to {env_path}. Check file permissions.")
         except Exception as e:
@@ -128,7 +128,7 @@ class APIKeyRotator:
         self._key_usage[prev_key] += 1
         
         # Log rotation without exposing key details
-        self.logger.info(f"API key rotated (key {self._index + 1} of {len(self.keys)})")
+        print(f"API key rotated (key {self._index + 1} of {len(self.keys)})")
         return new_key
 
     def get_key_usage_stats(self) -> Dict:
