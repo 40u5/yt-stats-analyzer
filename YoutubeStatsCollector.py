@@ -328,7 +328,6 @@ class YouTubeStatsCollector:
                     views = int(item["statistics"].get("viewCount", 0))
                     
                     pairs.append([cleaned_title, views])
-                    print(f"  📹 {cleaned_title} ({views:,} views)")
                     
             print(f"Fetched data for {len(pairs)} videos")
             return pairs

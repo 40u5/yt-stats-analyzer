@@ -43,6 +43,7 @@ class WeaviateEmbedder:
                     Property(name="channelId", data_type=DataType.TEXT, description="YouTube channel ID"),
                     Property(name="subscriberCount", data_type=DataType.INT, description="Number of subscribers for the channel"),
                     Property(name="videoId", data_type=DataType.TEXT, description="Unique video identifier"),
+                    Property(name="videoOrder", data_type=DataType.INT, description="Order of the video in the channel (1 = newest, N = oldest)"),
                 ],
                 vectorizer_config=Configure.Vectorizer.none()
             )
@@ -104,7 +105,7 @@ class WeaviateEmbedder:
         for channel_id, channel_data in data.items():
             subscriber_count = channel_data.get('subscriber_count', 0)
             
-            for video in channel_data.get('videos', []):
+            for order, video in enumerate(channel_data.get('videos', []), start=1):
                 if len(video) >= 2:
                     title, view_count = video[0], video[1]
                     
@@ -120,7 +121,8 @@ class WeaviateEmbedder:
                         'viewCount': view_count,
                         'channelId': channel_id,
                         'subscriberCount': subscriber_count,
-                        'videoId': video_id
+                        'videoId': video_id,
+                        'videoOrder': order
                     })
         
         if not videos_to_embed:
@@ -179,23 +181,14 @@ class WeaviateEmbedder:
             print(f"Error getting stats: {e}")
             return 0
     
-    def close(self):
-        """Close the Weaviate client connection."""
-        try:
-            if hasattr(self, 'client') and self.client:
-                self.client.close()
-                print("Weaviate client connection closed")
-        except Exception as e:
-            print(f"Error closing Weaviate client: {e}")
-
-    def embed_videos_for_channel(self, channel_id: str, subscriber_count: int, video_pairs: list):
+    def embed_videos_for_channel(self, channel_id: str, subscriber_count: int, video_pairs: list, force_recreate: bool = False):
         """Embed a list of videos for a channel directly into Weaviate."""
-        self.create_schema(force_recreate=False)
+        self.create_schema(force_recreate=force_recreate)
         existing_video_ids = self.get_existing_video_ids()
         videos_to_embed = []
         skipped_count = 0
         
-        for video in video_pairs:
+        for order, video in enumerate(video_pairs, start=1):
             if len(video) >= 2:
                 title, view_count = video[0], video[1]
                 video_id = f"{channel_id}_{title}"
@@ -207,7 +200,8 @@ class WeaviateEmbedder:
                     'viewCount': view_count,
                     'channelId': channel_id,
                     'subscriberCount': subscriber_count,
-                    'videoId': video_id
+                    'videoId': video_id,
+                    'videoOrder': order
                 })
         
         if not videos_to_embed:
@@ -218,6 +212,11 @@ class WeaviateEmbedder:
         embeddings = self.generate_embeddings(titles)
         batch_size = 100
         collection = self.client.collections.get("YouTubeVideo")
+        
+        # Add video order description to each video object
+        video_order_description = "Order of the video in the channel (1 = newest, N = oldest)"
+        for video in videos_to_embed:
+            video['videoOrderDescription'] = video_order_description
         
         for i in range(0, len(videos_to_embed), batch_size):
             batch = videos_to_embed[i:i + batch_size]
@@ -234,7 +233,17 @@ class WeaviateEmbedder:
         # Show the titles of videos that were embedded
         if videos_to_embed:
             print("  New videos embedded:")
+            print("    (videoOrder: 1 = newest, N = oldest)")
             for video in videos_to_embed:
-                print(f"{video['title']} ({video['viewCount']:,} views)")
+                print(f"{video['title']} (Order: {video['videoOrder']}, {video['viewCount']:,} views)")
         
         return len(videos_to_embed) 
+
+    def close(self):
+        """Close the Weaviate client connection."""
+        try:
+            if hasattr(self, 'client') and self.client:
+                self.client.close()
+                print("Weaviate client connection closed")
+        except Exception as e:
+            print(f"Error closing Weaviate client: {e}")
