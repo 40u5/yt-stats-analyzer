@@ -10,23 +10,18 @@ import os
 import re
 from typing import Optional, Dict, List, Tuple, Union
 
-import demoji
 import requests
 from requests.adapters import HTTPAdapter
-from googletrans import Translator
-from langdetect import detect_langs, LangDetectException
 
 from api_key_rotator import APIKeyRotator
 from exceptions import QuotaExhaustedError
 from WeaviateEmbedder import WeaviateEmbedder
+from TranslationHandler import TranslationHandler
 
 
 # Constants
 YOUTUBE_API_BASE_URL = "https://www.googleapis.com/youtube/v3"
 BATCH_SIZE = 50
-LANGUAGE_CONFIDENCE_THRESHOLD = 0.95
-ENGLISH_PATTERN = re.compile(r'^[A-Za-z0-9\s\-\.\,\!\?\:\;\'\"\/\(\)\#\@\&\*\+\=\%\$\[\]\{\}\|\\\~\`\^\<\>\_]+$')
-TITLE_CLEANUP_PATTERN = re.compile(r'[^A-Za-z0-9\s\-\.\,\!\?\:\;\'\"\/\(\)\#\@\&\*\+\=\%\$\[\]\{\}\|\\\~\`\^\<\>\_]+')
 
 # YouTube API constants
 VALID_ORDERS = {"date", "rating", "relevance", "title", "videoCount", "viewCount"}
@@ -61,7 +56,7 @@ class YouTubeStatsCollector:
     def __init__(self) -> None:
         """Initialize the collector with API key rotation."""
         self.rotator = APIKeyRotator()
-        self.translator = Translator()
+        self.translation_handler = TranslationHandler()
         self.embedder = WeaviateEmbedder()
         # Create a session for better connection management
         self.session = requests.Session()
@@ -235,62 +230,7 @@ class YouTubeStatsCollector:
     # Video Processing
     # --------------------------------------------------------------------- #
     
-    def _detect_language(self, text: str) -> str:
-        """
-        Detect the language of text with confidence threshold.
-        
-        Args:
-            text: Text to analyze
-            
-        Returns:
-            Language code (e.g., 'en', 'es', etc.)
-        """
-        try:
-            languages = detect_langs(text)
-            if not languages:
-                return "en"
-                
-            top_language = languages[0]
-            
-            # If confidence is low, look for non-English alternatives
-            if top_language.prob < LANGUAGE_CONFIDENCE_THRESHOLD:
-                for lang_obj in languages:
-                    if lang_obj.lang != 'en':
-                        return lang_obj.lang
-                return top_language.lang
-            
-            # High confidence case - validate English pattern
-            is_english = (
-                top_language.lang == 'en' and 
-                bool(ENGLISH_PATTERN.fullmatch(text))
-            )
-            return "en" if is_english else top_language.lang
-            
-        except LangDetectException as e:
-            print(f"Language detection error: {e}")
-            return "en"
 
-    async def _clean_title(self, title: str) -> str:
-        """
-        Clean and normalize video title.
-        
-        Args:
-            title: Raw video title
-            
-        Returns:
-            Cleaned title
-        """
-        # Remove emojis
-        title = demoji.replace(title, "")
-        
-        # Translate if not English
-        if self._detect_language(title) != "en":
-            print(f"Translating title: {title}")
-            translation = await self.translator.translate(title, dest='en')
-            title = translation.text
-        
-        # Clean unwanted characters
-        return TITLE_CLEANUP_PATTERN.sub('', title)
 
     async def fetch_video_pairs(self, video_ids: List[str]) -> Optional[List[List]]:
         """
@@ -324,7 +264,7 @@ class YouTubeStatsCollector:
 
                 for item in data["items"]:
                     raw_title = item["snippet"]["title"]
-                    cleaned_title = await self._clean_title(raw_title)
+                    cleaned_title = await self.translation_handler.clean_title(raw_title)
                     views = int(item["statistics"].get("viewCount", 0))
                     
                     pairs.append([cleaned_title, views])
@@ -544,16 +484,12 @@ class YouTubeStatsCollector:
             self.session.close()
             print("  ✅ Requests session closed")
 
-        # 2) if googletrans created an HTTPX AsyncClient, close it
-        client = getattr(self.translator, 'client', None)
-        if client is not None and hasattr(client, 'aclose'):
+        # 2) close the translation handler
+        if hasattr(self, 'translation_handler'):
             try:
-                await client.aclose()
-                print("  ✅ Google Translate client closed")
+                await self.translation_handler.aclose()
             except Exception as e:
-                print(f"  ⚠️  Warning: Error closing Google Translate client: {e}")
-        else:
-            print("  ℹ️  No Google Translate client to close")
+                print(f"  ⚠️  Warning: Error closing translation handler: {e}")
 
         # 3) for the embedder, just call its existing sync close()
         if hasattr(self.embedder, 'close'):
