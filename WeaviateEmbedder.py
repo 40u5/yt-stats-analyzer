@@ -105,7 +105,7 @@ class WeaviateEmbedder:
         for channel_id, channel_data in data.items():
             subscriber_count = channel_data.get('subscriber_count', 0)
             
-            for order, video in enumerate(channel_data.get('videos', []), start=1):
+            for video in enumerate(channel_data.get('videos', []), start=1):
                 if len(video) >= 2:
                     title, view_count = video[0], video[1]
                     
@@ -122,7 +122,6 @@ class WeaviateEmbedder:
                         'channelId': channel_id,
                         'subscriberCount': subscriber_count,
                         'videoId': video_id,
-                        'videoOrder': order
                     })
         
         if not videos_to_embed:
@@ -188,7 +187,7 @@ class WeaviateEmbedder:
         videos_to_embed = []
         skipped_count = 0
         
-        for order, video in enumerate(video_pairs, start=1):
+        for video in enumerate(video_pairs, start=1):
             if len(video) >= 2:
                 title, view_count = video[0], video[1]
                 video_id = f"{channel_id}_{title}"
@@ -201,7 +200,6 @@ class WeaviateEmbedder:
                     'channelId': channel_id,
                     'subscriberCount': subscriber_count,
                     'videoId': video_id,
-                    'videoOrder': order
                 })
         
         if not videos_to_embed:
@@ -212,12 +210,7 @@ class WeaviateEmbedder:
         embeddings = self.generate_embeddings(titles)
         batch_size = 100
         collection = self.client.collections.get("YouTubeVideo")
-        
-        # Add video order description to each video object
-        video_order_description = "Order of the video in the channel (1 = newest, N = oldest)"
-        for video in videos_to_embed:
-            video['videoOrderDescription'] = video_order_description
-        
+                
         for i in range(0, len(videos_to_embed), batch_size):
             batch = videos_to_embed[i:i + batch_size]
             batch_embeddings = embeddings[i:i + batch_size]
@@ -229,14 +222,7 @@ class WeaviateEmbedder:
                     )
         
         print(f"📋 Channel {channel_id}: {len(video_pairs)} videos fetched, {skipped_count} duplicates skipped, {len(videos_to_embed)} new videos embedded")
-        
-        # Show the titles of videos that were embedded
-        if videos_to_embed:
-            print("  New videos embedded:")
-            print("    (videoOrder: 1 = newest, N = oldest)")
-            for video in videos_to_embed:
-                print(f"{video['title']} (Order: {video['videoOrder']}, {video['viewCount']:,} views)")
-        
+                
         return len(videos_to_embed) 
 
     def close(self):
