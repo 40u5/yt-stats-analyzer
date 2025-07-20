@@ -30,10 +30,10 @@ async def main():
     config = {
         "num_channels": True,  # Set to True for infinite mode, or a number for finite mode
         "max_videos_per_channel": 10,
-        "keywords": "diy, technology, engineering",
+        "keywords": str(input("Enter keywords: ")),
         "duration_type": 0,  # 0=short, 1=medium, 2=long
         "order": "relevance",
-        "video_category_id": 28,  # Science & Technology
+        "video_category_id": 20,  # Gaming
         "write_to_weaviate": write_to_weaviate
     }
     
